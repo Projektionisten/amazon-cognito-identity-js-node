@@ -1205,7 +1205,7 @@ module.exports = class CognitoUser {
   async globalSignOut() {
     return new Promise((resolve, reject) => {
       if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
-    return reject(new Error('User is not authenticated')l);
+        return reject(new Error('User is not authenticated'));
       }
 
       this.client.makeUnauthenticatedRequest('globalSignOut', {
