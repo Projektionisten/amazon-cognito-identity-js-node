@@ -92,31 +92,29 @@ module.exports = class CognitoUserPool {
    * @param {nodeCallback<SignUpResult>} callback Called on error or with the new user.
    * @returns {void}
    */
-  async signUp(username, password, userAttributes, validationData) {
-    return new Promise((resolve, reject) => {
-      this.client.makeUnauthenticatedRequest('signUp', {
-        ClientId: this.clientId,
+  signUp(username, password, userAttributes, validationData, callback) {
+    this.client.makeUnauthenticatedRequest('signUp', {
+      ClientId: this.clientId,
+      Username: username,
+      Password: password,
+      UserAttributes: userAttributes,
+      ValidationData: validationData,
+    }, (err, data) => {
+      if (err) {
+        return callback(err, null);
+      }
+
+      const cognitoUser = {
         Username: username,
-        Password: password,
-        UserAttributes: userAttributes,
-        ValidationData: validationData,
-      }, (err, data) => {
-        if (err) {
-          return reject(err);
-        }
+        Pool: this,
+      };
 
-        const cognitoUser = {
-          Username: username,
-          Pool: this,
-        };
+      const returnData = {
+        user: new CognitoUser(cognitoUser),
+        userConfirmed: data.UserConfirmed,
+      };
 
-        const returnData = {
-          user: new CognitoUser(cognitoUser),
-          userConfirmed: data.UserConfirmed,
-        };
-
-        return resolve(returnData);
-      });
+      return callback(null, returnData);
     });
   }
 

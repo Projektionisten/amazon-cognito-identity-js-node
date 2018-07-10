@@ -136,7 +136,7 @@ module.exports = class CognitoUser {
    * @param {authSuccess} callback.onSuccess Called on success with the new session.
    * @returns {void}
    */
-  async authenticateUser(authDetails) {
+  authenticateUser(authDetails, callback) {
     const authenticationHelper = new AuthenticationHelper(
       this.pool.getUserPoolId().split('_')[1],
       this.pool.getParanoia());
@@ -157,96 +157,86 @@ module.exports = class CognitoUser {
       authParameters.CHALLENGE_NAME = 'SRP_A';
     }
 
-    return new Promise((resolve, reject) => {
-      this.client.makeUnauthenticatedRequest('initiateAuth', {
-        AuthFlow: this.authenticationFlowType,
+    this.client.makeUnauthenticatedRequest('initiateAuth', {
+      AuthFlow: this.authenticationFlowType,
+      ClientId: this.pool.getClientId(),
+      AuthParameters: authParameters,
+      ClientMetadata: authDetails.getValidationData(),
+    }, (err, data) => {
+      if (err) {
+        return callback.onFailure(err);
+      }
+
+      const challengeParameters = data.ChallengeParameters;
+
+      this.username = challengeParameters.USER_ID_FOR_SRP;
+      serverBValue = new BigInteger(challengeParameters.SRP_B, 16);
+      salt = new BigInteger(challengeParameters.SALT, 16);
+      this.getCachedDeviceKeyAndPassword();
+
+      const hkdf = authenticationHelper.getPasswordAuthenticationKey(
+        this.username,
+        authDetails.getPassword(),
+        serverBValue,
+        salt);
+      const secretBlockBits = sjcl.codec.base64.toBits(challengeParameters.SECRET_BLOCK);
+
+      const mac = new sjcl.misc.hmac(hkdf, sjcl.hash.sha256);
+      mac.update(sjcl.codec.utf8String.toBits(this.pool.getUserPoolId().split('_')[1]));
+      mac.update(sjcl.codec.utf8String.toBits(this.username));
+      mac.update(secretBlockBits);
+      const dateNow = dateHelper.getNowString();
+      mac.update(sjcl.codec.utf8String.toBits(dateNow));
+      const signature = mac.digest();
+      const signatureString = sjcl.codec.base64.fromBits(signature);
+
+      const challengeResponses = {};
+
+      challengeResponses.USERNAME = this.username;
+      challengeResponses.PASSWORD_CLAIM_SECRET_BLOCK = challengeParameters.SECRET_BLOCK;
+      challengeResponses.TIMESTAMP = dateNow;
+      challengeResponses.PASSWORD_CLAIM_SIGNATURE = signatureString;
+
+      if (this.deviceKey != null) {
+        challengeResponses.DEVICE_KEY = this.deviceKey;
+      }
+
+      this.client.makeUnauthenticatedRequest('respondToAuthChallenge', {
+        ChallengeName: 'PASSWORD_VERIFIER',
         ClientId: this.pool.getClientId(),
-        AuthParameters: authParameters,
-        ClientMetadata: authDetails.getValidationData(),
-      }, (err, data) => {
-        if (err) {
-          return reject(err);
+        ChallengeResponses: challengeResponses,
+        Session: data.Session,
+      }, (errAuthenticate, dataAuthenticate) => {
+        if (errAuthenticate) {
+          return callback.onFailure(errAuthenticate);
         }
 
-        const challengeParameters = data.ChallengeParameters;
+        const challengeName = dataAuthenticate.ChallengeName;
+        if (challengeName === 'NEW_PASSWORD_REQUIRED') {
+          this.Session = dataAuthenticate.Session;
+          let userAttributes = null;
+          let rawRequiredAttributes = null;
+          const requiredAttributes = [];
+          const userAttributesPrefix = authenticationHelper
+            .getNewPasswordRequiredChallengeUserAttributePrefix();
 
-        this.username = challengeParameters.USER_ID_FOR_SRP;
-        serverBValue = new BigInteger(challengeParameters.SRP_B, 16);
-        salt = new BigInteger(challengeParameters.SALT, 16);
+          if (dataAuthenticate.ChallengeParameters) {
+            userAttributes = JSON.parse(
+              dataAuthenticate.ChallengeParameters.userAttributes);
+            rawRequiredAttributes = JSON.parse(
+              dataAuthenticate.ChallengeParameters.requiredAttributes);
+          }
 
-        const hkdf = authenticationHelper.getPasswordAuthenticationKey(
-          this.username,
-          authDetails.getPassword(),
-          serverBValue,
-          salt);
-        const secretBlockBits = sjcl.codec.base64.toBits(challengeParameters.SECRET_BLOCK);
-
-        const mac = new sjcl.misc.hmac(hkdf, sjcl.hash.sha256);
-        mac.update(sjcl.codec.utf8String.toBits(this.pool.getUserPoolId().split('_')[1]));
-        mac.update(sjcl.codec.utf8String.toBits(this.username));
-        mac.update(secretBlockBits);
-        const dateNow = dateHelper.getNowString();
-        mac.update(sjcl.codec.utf8String.toBits(dateNow));
-        const signature = mac.digest();
-        const signatureString = sjcl.codec.base64.fromBits(signature);
-
-        const challengeResponses = {};
-
-        challengeResponses.USERNAME = this.username;
-        challengeResponses.PASSWORD_CLAIM_SECRET_BLOCK = challengeParameters.SECRET_BLOCK;
-        challengeResponses.TIMESTAMP = dateNow;
-        challengeResponses.PASSWORD_CLAIM_SIGNATURE = signatureString;
-
-        if (this.deviceKey != null) {
-          challengeResponses.DEVICE_KEY = this.deviceKey;
+          if (rawRequiredAttributes) {
+            for (let i = 0; i < rawRequiredAttributes.length; i++) {
+              requiredAttributes[i] = rawRequiredAttributes[i].substr(userAttributesPrefix.length);
+            }
+          }
+          return callback.newPasswordRequired(userAttributes, requiredAttributes);
         }
-
-        this.client.makeUnauthenticatedRequest('respondToAuthChallenge', {
-          ChallengeName: 'PASSWORD_VERIFIER',
-          ClientId: this.pool.getClientId(),
-          ChallengeResponses: challengeResponses,
-          Session: data.Session,
-        }, (errAuthenticate, dataAuthenticate) => {
-          if (errAuthenticate) {
-            return reject(errAuthenticate);
-          }
-
-          const challengeName = dataAuthenticate.ChallengeName;
-          if (challengeName === 'NEW_PASSWORD_REQUIRED') {
-            this.Session = dataAuthenticate.Session;
-            let userAttributes = null;
-            let rawRequiredAttributes = null;
-            const requiredAttributes = [];
-            const userAttributesPrefix = authenticationHelper
-              .getNewPasswordRequiredChallengeUserAttributePrefix();
-
-            if (dataAuthenticate.ChallengeParameters) {
-              userAttributes = JSON.parse(
-                dataAuthenticate.ChallengeParameters.userAttributes);
-              rawRequiredAttributes = JSON.parse(
-                dataAuthenticate.ChallengeParameters.requiredAttributes);
-            }
-
-            if (rawRequiredAttributes) {
-              for (let i = 0; i < rawRequiredAttributes.length; i++) {
-                requiredAttributes[i] = rawRequiredAttributes[i].substr(userAttributesPrefix.length);
-              }
-            }
-            // TODO:
-            const error = new Error("new password is required");
-            error.data = {"userAttributes": userAttributes, "requiredAttributes": requiredAttributes}
-            return reject(error);
-          }
-
-          return this.authenticateUserInternal(dataAuthenticate, authenticationHelper).then(value => {
-            resolve(value);
-          }).catch(err => {
-            reject(err);
-          });
-        });
-
-        return undefined;
+        return this.authenticateUserInternal(dataAuthenticate, authenticationHelper, callback);
       });
+      return undefined;
     });
   }
 
@@ -258,75 +248,66 @@ module.exports = class CognitoUser {
   * @param {callback} callback passed on from caller
   * @returns {void}
   */
-  async authenticateUserInternal(dataAuthenticate, authenticationHelper, callback) {
-    return new Promise((resolve, reject) => {
-      const challengeName = dataAuthenticate.ChallengeName;
-      if (challengeName === 'SMS_MFA') {
-        this.Session = dataAuthenticate.Session;
-        // TODO:
-        const error = new Error("MFA is Required");
-        error.data = {"challengeName": challengeName}
-        return reject(error);
-      }
+  authenticateUserInternal(dataAuthenticate, authenticationHelper, callback) {
+    const challengeName = dataAuthenticate.ChallengeName;
+    if (challengeName === 'SMS_MFA') {
+      this.Session = dataAuthenticate.Session;
+      return callback.mfaRequired(challengeName);
+    }
 
-      if (challengeName === 'CUSTOM_CHALLENGE') {
-        this.Session = dataAuthenticate.Session;
-        // TODO:
-        const error = new Error("Custom challenge");
-        error.data = {"ChallengeParameters": dataAuthenticate.ChallengeParameters}
-        return reject(error);
-      }
+    if (challengeName === 'CUSTOM_CHALLENGE') {
+      this.Session = dataAuthenticate.Session;
+      return callback.customChallenge(dataAuthenticate.ChallengeParameters);
+    }
 
-      if (challengeName === 'DEVICE_SRP_AUTH') {
-        // TODO:
-        this.getDeviceResponse(callback);
-        return undefined;
-      }
-
-      this.signInUserSession = this.getCognitoUserSession(dataAuthenticate.AuthenticationResult);
-      this.cacheTokens();
-
-      const newDeviceMetadata = dataAuthenticate.AuthenticationResult.NewDeviceMetadata;
-      if (newDeviceMetadata == null) {
-        return resolve(this.signInUserSession);
-      }
-
-      authenticationHelper.generateHashDevice(
-        dataAuthenticate.AuthenticationResult.NewDeviceMetadata.DeviceGroupKey,
-        dataAuthenticate.AuthenticationResult.NewDeviceMetadata.DeviceKey);
-
-      const deviceSecretVerifierConfig = {
-        Salt: sjcl.codec.base64.fromBits(sjcl.codec.hex.toBits(
-                authenticationHelper.getSaltDevices().toString(16))),
-        PasswordVerifier: sjcl.codec.base64.fromBits(sjcl.codec.hex.toBits(
-                authenticationHelper.getVerifierDevices().toString(16))),
-      };
-
-      this.verifierDevices = sjcl.codec.base64.fromBits(
-        authenticationHelper.getVerifierDevices());
-      this.deviceGroupKey = newDeviceMetadata.DeviceGroupKey;
-      this.randomPassword = authenticationHelper.getRandomPassword();
-
-      this.client.makeUnauthenticatedRequest('confirmDevice', {
-        DeviceKey: newDeviceMetadata.DeviceKey,
-        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-        DeviceSecretVerifierConfig: deviceSecretVerifierConfig,
-        DeviceName: 'nodejs-https/amazon-cognito-identity-js-node',
-      }, (errConfirm, dataConfirm) => {
-        if (errConfirm) {
-          return reject(errConfirm);
-        }
-
-        this.deviceKey = dataAuthenticate.AuthenticationResult.NewDeviceMetadata.DeviceKey;
-        this.cacheDeviceKeyAndPassword();
-        if (dataConfirm.UserConfirmationNecessary === true) {
-          return resolve(
-            this.signInUserSession, dataConfirm.UserConfirmationNecessary);
-        }
-        return resolve(this.signInUserSession);
-      });
+    if (challengeName === 'DEVICE_SRP_AUTH') {
+      this.getDeviceResponse(callback);
       return undefined;
+    }
+
+    this.signInUserSession = this.getCognitoUserSession(dataAuthenticate.AuthenticationResult);
+    this.cacheTokens();
+
+    const newDeviceMetadata = dataAuthenticate.AuthenticationResult.NewDeviceMetadata;
+    if (newDeviceMetadata == null) {
+      return callback.onSuccess(this.signInUserSession);
+    }
+
+    authenticationHelper.generateHashDevice(
+      dataAuthenticate.AuthenticationResult.NewDeviceMetadata.DeviceGroupKey,
+      dataAuthenticate.AuthenticationResult.NewDeviceMetadata.DeviceKey);
+
+    const deviceSecretVerifierConfig = {
+      Salt: sjcl.codec.base64.fromBits(sjcl.codec.hex.toBits(
+              authenticationHelper.getSaltDevices().toString(16))),
+      PasswordVerifier: sjcl.codec.base64.fromBits(sjcl.codec.hex.toBits(
+              authenticationHelper.getVerifierDevices().toString(16))),
+    };
+
+    this.verifierDevices = sjcl.codec.base64.fromBits(
+      authenticationHelper.getVerifierDevices());
+    this.deviceGroupKey = newDeviceMetadata.DeviceGroupKey;
+    this.randomPassword = authenticationHelper.getRandomPassword();
+
+    this.client.makeUnauthenticatedRequest('confirmDevice', {
+      DeviceKey: newDeviceMetadata.DeviceKey,
+      AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+      DeviceSecretVerifierConfig: deviceSecretVerifierConfig,
+      DeviceName: navigator.userAgent,
+    }, (errConfirm, dataConfirm) => {
+      if (errConfirm) {
+        return callback.onFailure(errConfirm);
+      }
+
+      this.deviceKey = dataAuthenticate.AuthenticationResult.NewDeviceMetadata.DeviceKey;
+      this.cacheDeviceKeyAndPassword();
+      if (dataConfirm.UserConfirmationNecessary === true) {
+        return callback.onSuccess(
+          this.signInUserSession, dataConfirm.UserConfirmationNecessary);
+      }
+      return callback.onSuccess(this.signInUserSession);
     });
+    return undefined;
   }
 
   /**
@@ -344,42 +325,35 @@ module.exports = class CognitoUser {
   * @returns {void}
   */
   completeNewPasswordChallenge(newPassword, requiredAttributeData, callback) {
-    return new Promise((resolve, reject) => {
-      if (!newPassword) {
-        return reject(new Error('New password is required.'));
-      }
-      const authenticationHelper = new AuthenticationHelper(
-        this.pool.getUserPoolId().split('_')[1], this.pool.getParanoia());
-      const userAttributesPrefix = authenticationHelper
-        .getNewPasswordRequiredChallengeUserAttributePrefix();
+    if (!newPassword) {
+      return callback.onFailure('New password is required.');
+    }
+    const authenticationHelper = new AuthenticationHelper(
+      this.pool.getUserPoolId().split('_')[1], this.pool.getParanoia());
+    const userAttributesPrefix = authenticationHelper
+      .getNewPasswordRequiredChallengeUserAttributePrefix();
 
-      const finalUserAttributes = {};
-      if (requiredAttributeData) {
-        Object.keys(requiredAttributeData).forEach((key) => {
-          finalUserAttributes[userAttributesPrefix + key] = requiredAttributeData[key];
-        });
-      }
-
-      finalUserAttributes.NEW_PASSWORD = newPassword;
-      finalUserAttributes.USERNAME = this.username;
-      this.client.makeUnauthenticatedRequest('respondToAuthChallenge', {
-        ChallengeName: 'NEW_PASSWORD_REQUIRED',
-        ClientId: this.pool.getClientId(),
-        ChallengeResponses: finalUserAttributes,
-        Session: this.Session,
-      }, (errAuthenticate, dataAuthenticate) => {
-        if (errAuthenticate) {
-          return reject(errAuthenticate);
-        }
-        return this.authenticateUserInternal(dataAuthenticate, authenticationHelper).then(value => {
-          resolve(value);
-        }).catch(err => {
-          reject(err);
-        });
+    const finalUserAttributes = {};
+    if (requiredAttributeData) {
+      Object.keys(requiredAttributeData).forEach((key) => {
+        finalUserAttributes[userAttributesPrefix + key] = requiredAttributeData[key];
       });
+    }
 
-      return undefined;
+    finalUserAttributes.NEW_PASSWORD = newPassword;
+    finalUserAttributes.USERNAME = this.username;
+    this.client.makeUnauthenticatedRequest('respondToAuthChallenge', {
+      ChallengeName: 'NEW_PASSWORD_REQUIRED',
+      ClientId: this.pool.getClientId(),
+      ChallengeResponses: finalUserAttributes,
+      Session: this.Session,
+    }, (errAuthenticate, dataAuthenticate) => {
+      if (errAuthenticate) {
+        return callback.onFailure(errAuthenticate);
+      }
+      return this.authenticateUserInternal(dataAuthenticate, authenticationHelper, callback);
     });
+    return undefined;
   }
 
   /**
@@ -392,7 +366,7 @@ module.exports = class CognitoUser {
    * @returns {void}
    * @private
    */
-  async getDeviceResponse() {
+  getDeviceResponse(callback) {
     const authenticationHelper = new AuthenticationHelper(
       this.deviceGroupKey,
       this.pool.getParanoia());
@@ -404,62 +378,60 @@ module.exports = class CognitoUser {
     authParameters.DEVICE_KEY = this.deviceKey;
     authParameters.SRP_A = authenticationHelper.getLargeAValue().toString(16);
 
-    return new Promise((resolve, reject) => {
+    this.client.makeUnauthenticatedRequest('respondToAuthChallenge', {
+      ChallengeName: 'DEVICE_SRP_AUTH',
+      ClientId: this.pool.getClientId(),
+      ChallengeResponses: authParameters,
+    }, (err, data) => {
+      if (err) {
+        return callback.onFailure(err);
+      }
+
+      const challengeParameters = data.ChallengeParameters;
+
+      const serverBValue = new BigInteger(challengeParameters.SRP_B, 16);
+      const salt = new BigInteger(challengeParameters.SALT, 16);
+
+      const hkdf = authenticationHelper.getPasswordAuthenticationKey(
+        this.deviceKey,
+        this.randomPassword,
+        serverBValue,
+        salt);
+      const secretBlockBits = sjcl.codec.base64.toBits(challengeParameters.SECRET_BLOCK);
+
+      const mac = new sjcl.misc.hmac(hkdf, sjcl.hash.sha256);
+      mac.update(sjcl.codec.utf8String.toBits(this.deviceGroupKey));
+      mac.update(sjcl.codec.utf8String.toBits(this.deviceKey));
+      mac.update(secretBlockBits);
+      const dateNow = dateHelper.getNowString();
+      mac.update(sjcl.codec.utf8String.toBits(dateNow));
+      const signature = mac.digest();
+      const signatureString = sjcl.codec.base64.fromBits(signature);
+
+      const challengeResponses = {};
+
+      challengeResponses.USERNAME = this.username;
+      challengeResponses.PASSWORD_CLAIM_SECRET_BLOCK = challengeParameters.SECRET_BLOCK;
+      challengeResponses.TIMESTAMP = dateNow;
+      challengeResponses.PASSWORD_CLAIM_SIGNATURE = signatureString;
+      challengeResponses.DEVICE_KEY = this.deviceKey;
+
       this.client.makeUnauthenticatedRequest('respondToAuthChallenge', {
-        ChallengeName: 'DEVICE_SRP_AUTH',
+        ChallengeName: 'DEVICE_PASSWORD_VERIFIER',
         ClientId: this.pool.getClientId(),
-        ChallengeResponses: authParameters,
-      }, (err, data) => {
-        if (err) {
-          return reject(err);
+        ChallengeResponses: challengeResponses,
+        Session: data.Session,
+      }, (errAuthenticate, dataAuthenticate) => {
+        if (errAuthenticate) {
+          return callback.onFailure(errAuthenticate);
         }
 
-        const challengeParameters = data.ChallengeParameters;
+        this.signInUserSession = this.getCognitoUserSession(dataAuthenticate.AuthenticationResult);
+        this.cacheTokens();
 
-        const serverBValue = new BigInteger(challengeParameters.SRP_B, 16);
-        const salt = new BigInteger(challengeParameters.SALT, 16);
-
-        const hkdf = authenticationHelper.getPasswordAuthenticationKey(
-          this.deviceKey,
-          this.randomPassword,
-          serverBValue,
-          salt);
-        const secretBlockBits = sjcl.codec.base64.toBits(challengeParameters.SECRET_BLOCK);
-
-        const mac = new sjcl.misc.hmac(hkdf, sjcl.hash.sha256);
-        mac.update(sjcl.codec.utf8String.toBits(this.deviceGroupKey));
-        mac.update(sjcl.codec.utf8String.toBits(this.deviceKey));
-        mac.update(secretBlockBits);
-        const dateNow = dateHelper.getNowString();
-        mac.update(sjcl.codec.utf8String.toBits(dateNow));
-        const signature = mac.digest();
-        const signatureString = sjcl.codec.base64.fromBits(signature);
-
-        const challengeResponses = {};
-
-        challengeResponses.USERNAME = this.username;
-        challengeResponses.PASSWORD_CLAIM_SECRET_BLOCK = challengeParameters.SECRET_BLOCK;
-        challengeResponses.TIMESTAMP = dateNow;
-        challengeResponses.PASSWORD_CLAIM_SIGNATURE = signatureString;
-        challengeResponses.DEVICE_KEY = this.deviceKey;
-
-        this.client.makeUnauthenticatedRequest('respondToAuthChallenge', {
-          ChallengeName: 'DEVICE_PASSWORD_VERIFIER',
-          ClientId: this.pool.getClientId(),
-          ChallengeResponses: challengeResponses,
-          Session: data.Session,
-        }, (errAuthenticate, dataAuthenticate) => {
-          if (errAuthenticate) {
-            return reject(errAuthenticate);
-          }
-
-          this.signInUserSession = this.getCognitoUserSession(dataAuthenticate.AuthenticationResult);
-          this.cacheTokens();
-
-          return resolve(this.signInUserSession);
-        });
-        return undefined;
+        return callback.onSuccess(this.signInUserSession);
       });
+      return undefined;
     });
   }
 
@@ -470,19 +442,17 @@ module.exports = class CognitoUser {
    * @param {nodeCallback<string>} callback Called on success or error.
    * @returns {void}
    */
-  confirmRegistration(confirmationCode, forceAliasCreation) {
-    return new Promise((resolve, reject) => {
-      this.client.makeUnauthenticatedRequest('confirmSignUp', {
-        ClientId: this.pool.getClientId(),
-        ConfirmationCode: confirmationCode,
-        Username: this.username,
-        ForceAliasCreation: forceAliasCreation,
-      }, err => {
-        if (err) {
-          return reject(err);
-        }
-        return resolve('SUCCESS');
-      });
+  confirmRegistration(confirmationCode, forceAliasCreation, callback) {
+    this.client.makeUnauthenticatedRequest('confirmSignUp', {
+      ClientId: this.pool.getClientId(),
+      ConfirmationCode: confirmationCode,
+      Username: this.username,
+      ForceAliasCreation: forceAliasCreation,
+    }, err => {
+      if (err) {
+        return callback(err, null);
+      }
+      return callback(null, 'SUCCESS');
     });
   }
 
@@ -496,36 +466,31 @@ module.exports = class CognitoUser {
    * @param {authSuccess} callback.onSuccess Called on success with the new session.
    * @returns {void}
    */
-  async sendCustomChallengeAnswer(answerChallenge) {
+  sendCustomChallengeAnswer(answerChallenge, callback) {
     const challengeResponses = {};
     challengeResponses.USERNAME = this.username;
     challengeResponses.ANSWER = answerChallenge;
 
-    return new Promise((resolve, reject) => {
-      this.client.makeUnauthenticatedRequest('respondToAuthChallenge', {
-        ChallengeName: 'CUSTOM_CHALLENGE',
-        ChallengeResponses: challengeResponses,
-        ClientId: this.pool.getClientId(),
-        Session: this.Session,
-      }, (err, data) => {
-        if (err) {
-          return reject(err);
-        }
+    this.client.makeUnauthenticatedRequest('respondToAuthChallenge', {
+      ChallengeName: 'CUSTOM_CHALLENGE',
+      ChallengeResponses: challengeResponses,
+      ClientId: this.pool.getClientId(),
+      Session: this.Session,
+    }, (err, data) => {
+      if (err) {
+        return callback.onFailure(err);
+      }
 
-        const challengeName = data.ChallengeName;
+      const challengeName = data.ChallengeName;
 
-        if (challengeName === 'CUSTOM_CHALLENGE') {
-          this.Session = data.Session;
-          // TODO:
-          const error = new Error("Custom challenge");
-          error.data = {"ChallengeParameters": dataAuthenticate.ChallengeParameters}
-          return reject(error);
-        }
+      if (challengeName === 'CUSTOM_CHALLENGE') {
+        this.Session = data.Session;
+        return callback.customChallenge(data.challengeParameters);
+      }
 
-        this.signInUserSession = this.getCognitoUserSession(data.AuthenticationResult);
-        this.cacheTokens();
-        return resolve(this.signInUserSession);
-      });
+      this.signInUserSession = this.getCognitoUserSession(data.AuthenticationResult);
+      this.cacheTokens();
+      return callback.onSuccess(this.signInUserSession);
     });
   }
 
@@ -537,7 +502,7 @@ module.exports = class CognitoUser {
    * @param {authSuccess} callback.onSuccess Called on success with the new session.
    * @returns {void}
    */
-  async sendMFACode(confirmationCode) {
+  sendMFACode(confirmationCode, callback) {
     const challengeResponses = {};
     challengeResponses.USERNAME = this.username;
     challengeResponses.SMS_MFA_CODE = confirmationCode;
@@ -546,65 +511,63 @@ module.exports = class CognitoUser {
       challengeResponses.DEVICE_KEY = this.deviceKey;
     }
 
-    return new Promise((resolve, reject) => {
-      this.client.makeUnauthenticatedRequest('respondToAuthChallenge', {
-        ChallengeName: 'SMS_MFA',
-        ChallengeResponses: challengeResponses,
-        ClientId: this.pool.getClientId(),
-        Session: this.Session,
-      }, (err, dataAuthenticate) => {
-        if (err) {
-          return reject(err);
+    this.client.makeUnauthenticatedRequest('respondToAuthChallenge', {
+      ChallengeName: 'SMS_MFA',
+      ChallengeResponses: challengeResponses,
+      ClientId: this.pool.getClientId(),
+      Session: this.Session,
+    }, (err, dataAuthenticate) => {
+      if (err) {
+        return callback.onFailure(err);
+      }
+
+      this.signInUserSession = this.getCognitoUserSession(dataAuthenticate.AuthenticationResult);
+      this.cacheTokens();
+
+      if (dataAuthenticate.AuthenticationResult.NewDeviceMetadata == null) {
+        return callback.onSuccess(this.signInUserSession);
+      }
+
+      const authenticationHelper = new AuthenticationHelper(
+        this.pool.getUserPoolId().split('_')[1],
+        this.pool.getParanoia());
+      authenticationHelper.generateHashDevice(
+        dataAuthenticate.AuthenticationResult.NewDeviceMetadata.DeviceGroupKey,
+        dataAuthenticate.AuthenticationResult.NewDeviceMetadata.DeviceKey);
+
+      const deviceSecretVerifierConfig = {
+        Salt: sjcl.codec.base64.fromBits(sjcl.codec.hex.toBits(
+          authenticationHelper.getSaltDevices().toString(16))),
+        PasswordVerifier: sjcl.codec.base64.fromBits(sjcl.codec.hex.toBits(
+          authenticationHelper.getVerifierDevices().toString(16))),
+      };
+
+      this.verifierDevices = sjcl.codec.base64.fromBits(
+        authenticationHelper.getVerifierDevices());
+      this.deviceGroupKey = dataAuthenticate.AuthenticationResult
+        .NewDeviceMetadata.DeviceGroupKey;
+      this.randomPassword = authenticationHelper.getRandomPassword();
+
+      this.client.makeUnauthenticatedRequest('confirmDevice', {
+        DeviceKey: dataAuthenticate.AuthenticationResult.NewDeviceMetadata.DeviceKey,
+        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+        DeviceSecretVerifierConfig: deviceSecretVerifierConfig,
+        DeviceName: navigator.userAgent,
+      }, (errConfirm, dataConfirm) => {
+        if (errConfirm) {
+          return callback.onFailure(errConfirm);
         }
 
-        this.signInUserSession = this.getCognitoUserSession(dataAuthenticate.AuthenticationResult);
-        this.cacheTokens();
-
-        if (dataAuthenticate.AuthenticationResult.NewDeviceMetadata == null) {
-          return resolve(this.signInUserSession);
+        this.deviceKey = dataAuthenticate.AuthenticationResult.NewDeviceMetadata.DeviceKey;
+        this.cacheDeviceKeyAndPassword();
+        if (dataConfirm.UserConfirmationNecessary === true) {
+          return callback.onSuccess(
+            this.signInUserSession,
+            dataConfirm.UserConfirmationNecessary);
         }
-
-        const authenticationHelper = new AuthenticationHelper(
-          this.pool.getUserPoolId().split('_')[1],
-          this.pool.getParanoia());
-        authenticationHelper.generateHashDevice(
-          dataAuthenticate.AuthenticationResult.NewDeviceMetadata.DeviceGroupKey,
-          dataAuthenticate.AuthenticationResult.NewDeviceMetadata.DeviceKey);
-
-        const deviceSecretVerifierConfig = {
-          Salt: sjcl.codec.base64.fromBits(sjcl.codec.hex.toBits(
-            authenticationHelper.getSaltDevices().toString(16))),
-          PasswordVerifier: sjcl.codec.base64.fromBits(sjcl.codec.hex.toBits(
-            authenticationHelper.getVerifierDevices().toString(16))),
-        };
-
-        this.verifierDevices = sjcl.codec.base64.fromBits(
-          authenticationHelper.getVerifierDevices());
-        this.deviceGroupKey = dataAuthenticate.AuthenticationResult
-          .NewDeviceMetadata.DeviceGroupKey;
-        this.randomPassword = authenticationHelper.getRandomPassword();
-
-        this.client.makeUnauthenticatedRequest('confirmDevice', {
-          DeviceKey: dataAuthenticate.AuthenticationResult.NewDeviceMetadata.DeviceKey,
-          AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-          DeviceSecretVerifierConfig: deviceSecretVerifierConfig,
-          DeviceName: 'nodejs-https/amazon-cognito-identity-js-node',
-        }, (errConfirm, dataConfirm) => {
-          if (errConfirm) {
-            return reject(errConfirm);
-          }
-
-          this.deviceKey = dataAuthenticate.AuthenticationResult.NewDeviceMetadata.DeviceKey;
-          this.cacheDeviceKeyAndPassword();
-          if (dataConfirm.UserConfirmationNecessary === true) {
-            return resolve(
-              this.signInUserSession,
-              dataConfirm.UserConfirmationNecessary);
-          }
-          return resolve(this.signInUserSession);
-        });
-        return undefined;
+        return callback.onSuccess(this.signInUserSession);
       });
+      return undefined;
     });
   }
 
@@ -615,25 +578,22 @@ module.exports = class CognitoUser {
    * @param {nodeCallback<string>} callback Called on success or error.
    * @returns {void}
    */
-  async changePassword(oldUserPassword, newUserPassword) {
-    return new Promise((resolve, reject) => {
-      if (!(this.signInUserSession != null && this.signInUserSession.isValid())) {
-        return reject(new Error('User is not authenticated'));
+  changePassword(oldUserPassword, newUserPassword, callback) {
+    if (!(this.signInUserSession != null && this.signInUserSession.isValid())) {
+      return callback(new Error('User is not authenticated'), null);
+    }
+
+    this.client.makeUnauthenticatedRequest('changePassword', {
+      PreviousPassword: oldUserPassword,
+      ProposedPassword: newUserPassword,
+      AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+    }, err => {
+      if (err) {
+        return callback(err, null);
       }
-
-      this.client.makeUnauthenticatedRequest('changePassword', {
-        PreviousPassword: oldUserPassword,
-        ProposedPassword: newUserPassword,
-        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-      }, err => {
-        if (err) {
-          return reject(err);
-        }
-        return resolve('SUCCESS');
-      });
-
-      return undefined;
+      return callback(null, 'SUCCESS');
     });
+    return undefined;
   }
 
   /**
@@ -641,80 +601,74 @@ module.exports = class CognitoUser {
    * @param {nodeCallback<string>} callback Called on success or error.
    * @returns {void}
    */
-  async enableMFA() {
-    return new Promise((resolve, reject) => {
-      if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
-        return reject(new Error('User is not authenticated'));
+  enableMFA(callback) {
+    if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
+      return callback(new Error('User is not authenticated'), null);
+    }
+
+    const mfaOptions = [];
+    const mfaEnabled = {
+      DeliveryMedium: 'SMS',
+      AttributeName: 'phone_number',
+    };
+    mfaOptions.push(mfaEnabled);
+
+    this.client.makeUnauthenticatedRequest('setUserSettings', {
+      MFAOptions: mfaOptions,
+      AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+    }, err => {
+      if (err) {
+        return callback(err, null);
       }
-
-      const mfaOptions = [];
-      const mfaEnabled = {
-        DeliveryMedium: 'SMS',
-        AttributeName: 'phone_number',
-      };
-      mfaOptions.push(mfaEnabled);
-
-      this.client.makeUnauthenticatedRequest('setUserSettings', {
-        MFAOptions: mfaOptions,
-        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-      }, err => {
-        if (err) {
-          return reject(err);
-        }
-        return resolve('SUCCESS');
-      });
-  
-      return undefined;
+      return callback(null, 'SUCCESS');
     });
+    return undefined;
   }
 
   /**
    * This is used by an authenticated user to disable MFA for himself
-   * @returns {Promise<String>}
+   * @param {nodeCallback<string>} callback Called on success or error.
+   * @returns {void}
    */
-  async disableMFA() {
-    return new Promise((resolve, reject) => {
-      if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
-        return reject(new Error('User is not authenticated'));
+  disableMFA(callback) {
+    if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
+      return callback(new Error('User is not authenticated'), null);
+    }
+
+    const mfaOptions = [];
+
+    this.client.makeUnauthenticatedRequest('setUserSettings', {
+      MFAOptions: mfaOptions,
+      AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+    }, err => {
+      if (err) {
+        return callback(err, null);
       }
-
-      const mfaOptions = [];
-
-      this.client.makeUnauthenticatedRequest('setUserSettings', {
-        MFAOptions: mfaOptions,
-        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-      }, err => {
-        if (err) {
-          return reject(err);
-        }
-    
-        return resolve('SUCCESS');
-      });
-      return undefined;
+      return callback(null, 'SUCCESS');
     });
+    return undefined;
   }
 
 
   /**
    * This is used by an authenticated user to delete himself
-   * @returns {Promise<String>}
+   * @param {nodeCallback<string>} callback Called on success or error.
+   * @returns {void}
    */
-  async deleteUser() {
-    return new Promise((resolve, reject) => {
-      if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
-        return reject(new Error('User is not authenticated'));
-      }
+  deleteUser(callback) {
+    if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
+      return callback(new Error('User is not authenticated'), null);
+    }
 
-      this.client.makeUnauthenticatedRequest('deleteUser', {
-        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-      }, err => {
-        if (err) {
-          return reject(err, null);
-        }
-        return resolve(null, 'SUCCESS');
-      });
-      return undefined;
+    this.client.makeUnauthenticatedRequest('deleteUser', {
+      AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+    }, err => {
+      if (err) {
+        return callback(err, null);
+      }
+      return callback(null, 'SUCCESS');
     });
+    return undefined;
   }
 
   /**
@@ -726,57 +680,54 @@ module.exports = class CognitoUser {
    * @param {nodeCallback<string>} callback Called on success or error.
    * @returns {void}
    */
-  async updateAttributes(attributes) {
-    return new Promise((resolve, reject) => {
-      if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
-        return reject(new Error('User is not authenticated'));
-      }
+  updateAttributes(attributes, callback) {
+    if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
+      return callback(new Error('User is not authenticated'), null);
+    }
 
-      this.client.makeUnauthenticatedRequest('updateUserAttributes', {
-        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-        UserAttributes: attributes,
-      }, err => {
-        if (err) {
-          return reject(err);
-        }
-        return resolve('SUCCESS');
-      });
-      return undefined;
+    this.client.makeUnauthenticatedRequest('updateUserAttributes', {
+      AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+      UserAttributes: attributes,
+    }, err => {
+      if (err) {
+        return callback(err, null);
+      }
+      return callback(null, 'SUCCESS');
     });
+    return undefined;
   }
 
   /**
    * This is used by an authenticated user to get a list of attributes
-   * @returns {Promise<CognitoUserAttribute[]>}
+   * @param {nodeCallback<CognitoUserAttribute[]>} callback Called on success or error.
+   * @returns {void}
    */
-  async getUserAttributes() {
-    return new Promise((resolve, reject) => {
-      if (!(this.signInUserSession != null && this.signInUserSession.isValid())) {
-        return reject(new Error('User is not authenticated'));
+  getUserAttributes(callback) {
+    if (!(this.signInUserSession != null && this.signInUserSession.isValid())) {
+      return callback(new Error('User is not authenticated'), null);
+    }
+
+    this.client.makeUnauthenticatedRequest('getUser', {
+      AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+    }, (err, userData) => {
+      if (err) {
+        return callback(err, null);
       }
 
-      this.client.makeUnauthenticatedRequest('getUser', {
-        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-      }, (err, userData) => {
-        if (err) {
-          return reject(err);
-        }
+      const attributeList = [];
 
-        const attributeList = [];
+      for (let i = 0; i < userData.UserAttributes.length; i++) {
+        const attribute = {
+          Name: userData.UserAttributes[i].Name,
+          Value: userData.UserAttributes[i].Value,
+        };
+        const userAttribute = new CognitoUserAttribute(attribute);
+        attributeList.push(userAttribute);
+      }
 
-        for (let i = 0; i < userData.UserAttributes.length; i++) {
-          const attribute = {
-            Name: userData.UserAttributes[i].Name,
-            Value: userData.UserAttributes[i].Value,
-          };
-          const userAttribute = new CognitoUserAttribute(attribute);
-          attributeList.push(userAttribute);
-        }
-
-        return resolve(attributeList);
-      });
-      return undefined;
+      return callback(null, attributeList);
     });
+    return undefined;
   }
 
   /**
@@ -785,23 +736,21 @@ module.exports = class CognitoUser {
    * @param {nodeCallback<string>} callback Called on success or error.
    * @returns {void}
    */
-  async deleteAttributes(attributeList) {
-    return new Promise((resolve, reject) => {
-      if (!(this.signInUserSession != null && this.signInUserSession.isValid())) {
-        return reject(new Error('User is not authenticated'));
-      }
+  deleteAttributes(attributeList, callback) {
+    if (!(this.signInUserSession != null && this.signInUserSession.isValid())) {
+      return callback(new Error('User is not authenticated'), null);
+    }
 
-      this.client.makeUnauthenticatedRequest('deleteUserAttributes', {
-        UserAttributeNames: attributeList,
-        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-      }, err => {
-        if (err) {
-          return reject(err);
-        }
-        return resolve('SUCCESS');
-      });
-      return undefined;
+    this.client.makeUnauthenticatedRequest('deleteUserAttributes', {
+      UserAttributeNames: attributeList,
+      AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+    }, err => {
+      if (err) {
+        return callback(err, null);
+      }
+      return callback(null, 'SUCCESS');
     });
+    return undefined;
   }
 
   /**
@@ -809,17 +758,15 @@ module.exports = class CognitoUser {
    * @param {nodeCallback<string>} callback Called on success or error.
    * @returns {void}
    */
-  async resendConfirmationCode() {
-    return new Promise((resolve, reject) => {
-      this.client.makeUnauthenticatedRequest('resendConfirmationCode', {
-        ClientId: this.pool.getClientId(),
-        Username: this.username,
-      }, err => {
-        if (err) {
-          return reject(err);
-        }
-        return resolve('SUCCESS');
-      });
+  resendConfirmationCode(callback) {
+    this.client.makeUnauthenticatedRequest('resendConfirmationCode', {
+      ClientId: this.pool.getClientId(),
+      Username: this.username,
+    }, err => {
+      if (err) {
+        return callback(err, null);
+      }
+      return callback(null, 'SUCCESS');
     });
   }
 
@@ -830,58 +777,52 @@ module.exports = class CognitoUser {
    * @param {nodeCallback<CognitoUserSession>} callback Called on success or error.
    * @returns {void}
    */
-  async getSession() {
-    return new Promise((resolve, reject) => {
-      if (this.username == null) {
-        return reject(new Error('Username is null. Cannot retrieve a new session'));
+  getSession(callback) {
+    if (this.username == null) {
+      return callback(new Error('Username is null. Cannot retrieve a new session'), null);
+    }
+
+    if (this.signInUserSession != null && this.signInUserSession.isValid()) {
+      return callback(null, this.signInUserSession);
+    }
+
+    const keyPrefix = `CognitoIdentityServiceProvider.${this.pool.getClientId()}.${this.username}`;
+    const idTokenKey = `${keyPrefix}.idToken`;
+    const accessTokenKey = `${keyPrefix}.accessToken`;
+    const refreshTokenKey = `${keyPrefix}.refreshToken`;
+
+//    const storage = window.localStorage;
+    const storage = new LocalStorage('/tmp/storage');
+
+    if (storage.getItem(idTokenKey)) {
+      const idToken = new CognitoIdToken({
+        IdToken: storage.getItem(idTokenKey),
+      });
+      const accessToken = new CognitoAccessToken({
+        AccessToken: storage.getItem(accessTokenKey),
+      });
+      const refreshToken = new CognitoRefreshToken({
+        RefreshToken: storage.getItem(refreshTokenKey),
+      });
+
+      const sessionData = {
+        IdToken: idToken,
+        AccessToken: accessToken,
+        RefreshToken: refreshToken,
+      };
+      const cachedSession = new CognitoUserSession(sessionData);
+      if (cachedSession.isValid()) {
+        this.signInUserSession = cachedSession;
+        return callback(null, this.signInUserSession);
       }
 
-      if (this.signInUserSession != null && this.signInUserSession.isValid()) {
-        return resolve(this.signInUserSession);
+      if (refreshToken.getToken() == null) {
+        return callback(new Error('Cannot retrieve a new session. Please authenticate.'), null);
       }
 
-      const keyPrefix = `CognitoIdentityServiceProvider.${this.pool.getClientId()}.${this.username}`;
-      const idTokenKey = `${keyPrefix}.idToken`;
-      const accessTokenKey = `${keyPrefix}.accessToken`;
-      const refreshTokenKey = `${keyPrefix}.refreshToken`;
-
-  //    const storage = window.localStorage;
-      const storage = new LocalStorage('/tmp/storage');
-
-      if (storage.getItem(idTokenKey)) {
-        const idToken = new CognitoIdToken({
-          IdToken: storage.getItem(idTokenKey),
-        });
-        const accessToken = new CognitoAccessToken({
-          AccessToken: storage.getItem(accessTokenKey),
-        });
-        const refreshToken = new CognitoRefreshToken({
-          RefreshToken: storage.getItem(refreshTokenKey),
-        });
-
-        const sessionData = {
-          IdToken: idToken,
-          AccessToken: accessToken,
-          RefreshToken: refreshToken,
-        };
-        const cachedSession = new CognitoUserSession(sessionData);
-        if (cachedSession.isValid()) {
-          this.signInUserSession = cachedSession;
-          return resolve(this.signInUserSession);
-        }
-
-        if (refreshToken.getToken() == null) {
-          return reject(new Error('Cannot retrieve a new session. Please authenticate.'));
-        }
-
-        return this.refreshSession(refreshToken).then(value => {
-          resolve(value);
-        }).catch(err => {
-          reject(err);
-        });
-      }
-      return undefined;
-    });
+      this.refreshSession(refreshToken, callback);
+    }
+    return undefined;
   }
 
 
@@ -891,7 +832,7 @@ module.exports = class CognitoUser {
    * @param {nodeCallback<CognitoUserSession>} callback Called on success or error.
    * @returns {void}
    */
-  async refreshSession(refreshToken) {
+  refreshSession(refreshToken, callback) {
     const authParameters = {};
     authParameters.REFRESH_TOKEN = refreshToken.getToken();
     const keyPrefix = `CognitoIdentityServiceProvider.${this.pool.getClientId()}`;
@@ -908,314 +849,23 @@ module.exports = class CognitoUser {
       authParameters.DEVICE_KEY = this.deviceKey;
     }
 
-    return new Promise((resolve, reject) => {
-      this.client.makeUnauthenticatedRequest('initiateAuth', {
-        ClientId: this.pool.getClientId(),
-        AuthFlow: 'REFRESH_TOKEN_AUTH',
-        AuthParameters: authParameters,
-      }, (err, authResult) => {
-        if (err) {
-          return reject(err);
-        }
-        if (authResult) {
-          const authenticationResult = authResult.AuthenticationResult;
-          if (!Object.prototype.hasOwnProperty.call(authenticationResult, 'RefreshToken')) {
-            authenticationResult.RefreshToken = refreshToken.getToken();
-          }
-          this.signInUserSession = this.getCognitoUserSession(authenticationResult);
-          this.cacheTokens();
-          return resolve(this.signInUserSession);
-        }
-        return undefined;
-      });
-    });
-  }
-
-  /**
-   * This is used to build a user session from tokens retrieved in the authentication result
-   * @param {object} authResult Successful auth response from server.
-   * @returns {CognitoUserSession} The new user session.
-   * @private
-   */
-  getCognitoUserSession(authResult) {
-    const idToken = new CognitoIdToken(authResult);
-    const accessToken = new CognitoAccessToken(authResult);
-    const refreshToken = new CognitoRefreshToken(authResult);
-
-    const sessionData = {
-      IdToken: idToken,
-      AccessToken: accessToken,
-      RefreshToken: refreshToken,
-    };
-
-    return new CognitoUserSession(sessionData);
-  }
-
-  /**
-   * This is used to initiate a forgot password request
-   * @param {object} callback Result callback map.
-   * @param {onFailure} callback.onFailure Called on any error.
-   * @param {inputVerificationCode?} callback.inputVerificationCode
-   *    Optional callback raised instead of onSuccess with response data.
-   * @param {onSuccess<void>?} callback.onSuccess Called on success.
-   * @returns {void}
-   */
-  async forgotPassword() {
-    return new Promise((resolve, reject) => {
-      this.client.makeUnauthenticatedRequest('forgotPassword', {
-        ClientId: this.pool.getClientId(),
-        Username: this.username,
-      }, (err, data) => {
-        if (err) {
-          return reject(err);
-        }
-
-        return resolve(data);
-      });
-    });
-  }
-
-  /**
-   * This is used to confirm a new password using a confirmationCode
-   * @param {string} confirmationCode Code entered by user.
-   * @param {string} newPassword Confirm new password.
-   * @param {object} callback Result callback map.
-   * @param {onFailure} callback.onFailure Called on any error.
-   * @param {onSuccess<void>} callback.onSuccess Called on success.
-   * @returns {void}
-   */
-  async confirmPassword(confirmationCode, newPassword) {
-    return new Promise((resolve, reject) => {
-      this.client.makeUnauthenticatedRequest('confirmForgotPassword', {
-        ClientId: this.pool.getClientId(),
-        Username: this.username,
-        ConfirmationCode: confirmationCode,
-        Password: newPassword,
-      }, err => {
-        if (err) {
-          return reject(err);
-        }
-        return resolve();
-      });
-    });
-  }
-
-  /**
-   * This is used to initiate an attribute confirmation request
-   * @param {string} attributeName User attribute that needs confirmation.
-   * @param {object} callback Result callback map.
-   * @param {onFailure} callback.onFailure Called on any error.
-   * @param {inputVerificationCode} callback.inputVerificationCode Called on success.
-   * @returns {void}
-   */
-  async getAttributeVerificationCode(attributeName) {
-    return new Promise((resolve, reject) => {
-      if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
-        return reject(new Error('User is not authenticated'));
+    this.client.makeUnauthenticatedRequest('initiateAuth', {
+      ClientId: this.pool.getClientId(),
+      AuthFlow: 'REFRESH_TOKEN_AUTH',
+      AuthParameters: authParameters,
+    }, (err, authResult) => {
+      if (err) {
+        return callback(err, null);
       }
-
-      this.client.makeUnauthenticatedRequest('getUserAttributeVerificationCode', {
-        AttributeName: attributeName,
-        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-      }, (err, data) => {
-        if (err) {
-          return reject(err);
+      if (authResult) {
+        const authenticationResult = authResult.AuthenticationResult;
+        if (!Object.prototype.hasOwnProperty.call(authenticationResult, 'RefreshToken')) {
+          authenticationResult.RefreshToken = refreshToken.getToken();
         }
-        return resolve(data);
-      });
-      return undefined;
-    });
-  }
-
-  /**
-   * This is used to confirm an attribute using a confirmation code
-   * @param {string} attributeName Attribute being confirmed.
-   * @param {string} confirmationCode Code entered by user.
-   * @param {object} callback Result callback map.
-   * @param {onFailure} callback.onFailure Called on any error.
-   * @param {onSuccess<string>} callback.onSuccess Called on success.
-   * @returns {void}
-   */
-  async verifyAttribute(attributeName, confirmationCode) {
-    return new Promise((resolve, reject) => {
-      if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
-        return reject(new Error('User is not authenticated'));
+        this.signInUserSession = this.getCognitoUserSession(authenticationResult);
+        this.cacheTokens();
+        return callback(null, this.signInUserSession);
       }
-
-      this.client.makeUnauthenticatedRequest('verifyUserAttribute', {
-        AttributeName: attributeName,
-        Code: confirmationCode,
-        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-      }, err => {
-        if (err) {
-          return reject(err);
-        }
-        return resolve('SUCCESS');
-      });
-      return undefined;
-    });
-  }
-
-  /**
-   * This is used to get the device information using the current device key
-   * @param {object} callback Result callback map.
-   * @param {onFailure} callback.onFailure Called on any error.
-   * @param {onSuccess<*>} callback.onSuccess Called on success with device data.
-   * @returns {void}
-   */
-  async getDevice() {
-    return new Promise((resolve, reject) => {
-      if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
-        return resolve(new Error('User is not authenticated'));
-      }
-
-      this.client.makeUnauthenticatedRequest('getDevice', {
-        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-        DeviceKey: this.deviceKey,
-      }, (err, data) => {
-        if (err) {
-          return reject(err);
-        }
-        return resolve(data);
-      });
-      return undefined;
-    });
-  }
-
-  /**
-   * This is used to forget the current device
-   * @param {object} callback Result callback map.
-   * @param {onFailure} callback.onFailure Called on any error.
-   * @param {onSuccess<string>} callback.onSuccess Called on success.
-   * @returns {void}
-   */
-  async forgetDevice() {
-    return new Promise((resolve, reject) => {
-      if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
-        return reject(new Error('User is not authenticated'));
-      }
-
-      this.client.makeUnauthenticatedRequest('forgetDevice', {
-        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-        DeviceKey: this.deviceKey,
-      }, err => {
-        if (err) {
-          return reject(err);
-        }
-        this.deviceKey = null;
-        this.deviceGroupkey = null;
-        this.randomPassword = null;
-        return resolve('SUCCESS');
-      });
-      return undefined;
-    });
-  }
-
-  /**
-   * This is used to set the device status as remembered
-   * @param {object} callback Result callback map.
-   * @param {onFailure} callback.onFailure Called on any error.
-   * @param {onSuccess<string>} callback.onSuccess Called on success.
-   * @returns {void}
-   */
-  async setDeviceStatusRemembered() {
-    return new Promise((resolve, reject) => {
-      if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
-        return reject(new Error('User is not authenticated'));
-      }
-
-      this.client.makeUnauthenticatedRequest('updateDeviceStatus', {
-        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-        DeviceKey: this.deviceKey,
-        DeviceRememberedStatus: 'remembered',
-      }, err => {
-        if (err) {
-          return reject(err);
-        }
-        return resolve('SUCCESS');
-      });
-      return undefined;
-    });
-  }
-
-  /**
-   * This is used to set the device status as not remembered
-   * @param {object} callback Result callback map.
-   * @param {onFailure} callback.onFailure Called on any error.
-   * @param {onSuccess<string>} callback.onSuccess Called on success.
-   * @returns {void}
-   */
-  async setDeviceStatusNotRemembered() {
-    return new Promise((resolve, reject) => {
-      if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
-        return reject(new Error('User is not authenticated'));
-      }
-
-      this.client.makeUnauthenticatedRequest('updateDeviceStatus', {
-        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-        DeviceKey: this.deviceKey,
-        DeviceRememberedStatus: 'not_remembered',
-      }, err => {
-        if (err) {
-          return reject(err);
-        }
-        return resolve('SUCCESS');
-      });
-      return undefined;
-    });
-  }
-
-  /**
-   * This is used to list all devices for a user
-   *
-   * @param {int} limit the number of devices returned in a call
-   * @param {string} paginationToken the pagination token in case any was returned before
-   * @param {object} callback Result callback map.
-   * @param {onFailure} callback.onFailure Called on any error.
-   * @param {onSuccess<*>} callback.onSuccess Called on success with device list.
-   * @returns {void}
-   */
-  async listDevices(limit, paginationToken) {
-    return new Promise((resolve, reject) => {
-      if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
-        return reject(new Error('User is not authenticated'));
-      }
-
-      this.client.makeUnauthenticatedRequest('listDevices', {
-        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-        Limit: limit,
-        PaginationToken: paginationToken,
-      }, (err, data) => {
-        if (err) {
-          return reject(err);
-        }
-        return resolve(data);
-      });
-      return undefined;
-    });
-  }
-
-  /**
-   * This is used to globally revoke all tokens issued to a user
-   * @param {object} callback Result callback map.
-   * @param {onFailure} callback.onFailure Called on any error.
-   * @param {onSuccess<string>} callback.onSuccess Called on success.
-   * @returns {void}
-   */
-  async globalSignOut() {
-    return new Promise((resolve, reject) => {
-      if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
-        return reject(new Error('User is not authenticated'));
-      }
-
-      this.client.makeUnauthenticatedRequest('globalSignOut', {
-        AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
-      }, err => {
-        if (err) {
-          return reject(err);
-        }
-        return resolve('SUCCESS');
-      });
       return undefined;
     });
   }
@@ -1317,11 +967,284 @@ module.exports = class CognitoUser {
   }
 
   /**
+   * This is used to build a user session from tokens retrieved in the authentication result
+   * @param {object} authResult Successful auth response from server.
+   * @returns {CognitoUserSession} The new user session.
+   * @private
+   */
+  getCognitoUserSession(authResult) {
+    const idToken = new CognitoIdToken(authResult);
+    const accessToken = new CognitoAccessToken(authResult);
+    const refreshToken = new CognitoRefreshToken(authResult);
+
+    const sessionData = {
+      IdToken: idToken,
+      AccessToken: accessToken,
+      RefreshToken: refreshToken,
+    };
+
+    return new CognitoUserSession(sessionData);
+  }
+
+  /**
+   * This is used to initiate a forgot password request
+   * @param {object} callback Result callback map.
+   * @param {onFailure} callback.onFailure Called on any error.
+   * @param {inputVerificationCode?} callback.inputVerificationCode
+   *    Optional callback raised instead of onSuccess with response data.
+   * @param {onSuccess<void>?} callback.onSuccess Called on success.
+   * @returns {void}
+   */
+  forgotPassword(callback) {
+    this.client.makeUnauthenticatedRequest('forgotPassword', {
+      ClientId: this.pool.getClientId(),
+      Username: this.username,
+    }, (err, data) => {
+      if (err) {
+        return callback.onFailure(err);
+      }
+      if (typeof callback.inputVerificationCode === 'function') {
+        return callback.inputVerificationCode(data);
+      }
+      return callback.onSuccess();
+    });
+  }
+
+  /**
+   * This is used to confirm a new password using a confirmationCode
+   * @param {string} confirmationCode Code entered by user.
+   * @param {string} newPassword Confirm new password.
+   * @param {object} callback Result callback map.
+   * @param {onFailure} callback.onFailure Called on any error.
+   * @param {onSuccess<void>} callback.onSuccess Called on success.
+   * @returns {void}
+   */
+  confirmPassword(confirmationCode, newPassword, callback) {
+    this.client.makeUnauthenticatedRequest('confirmForgotPassword', {
+      ClientId: this.pool.getClientId(),
+      Username: this.username,
+      ConfirmationCode: confirmationCode,
+      Password: newPassword,
+    }, err => {
+      if (err) {
+        return callback.onFailure(err);
+      }
+      return callback.onSuccess();
+    });
+  }
+
+  /**
+   * This is used to initiate an attribute confirmation request
+   * @param {string} attributeName User attribute that needs confirmation.
+   * @param {object} callback Result callback map.
+   * @param {onFailure} callback.onFailure Called on any error.
+   * @param {inputVerificationCode} callback.inputVerificationCode Called on success.
+   * @returns {void}
+   */
+  getAttributeVerificationCode(attributeName, callback) {
+    if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
+      return callback(new Error('User is not authenticated'), null);
+    }
+
+    this.client.makeUnauthenticatedRequest('getUserAttributeVerificationCode', {
+      AttributeName: attributeName,
+      AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+    }, (err, data) => {
+      if (err) {
+        return callback.onFailure(err);
+      }
+      return callback.inputVerificationCode(data);
+    });
+    return undefined;
+  }
+
+  /**
+   * This is used to confirm an attribute using a confirmation code
+   * @param {string} attributeName Attribute being confirmed.
+   * @param {string} confirmationCode Code entered by user.
+   * @param {object} callback Result callback map.
+   * @param {onFailure} callback.onFailure Called on any error.
+   * @param {onSuccess<string>} callback.onSuccess Called on success.
+   * @returns {void}
+   */
+  verifyAttribute(attributeName, confirmationCode, callback) {
+    if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
+      return callback(new Error('User is not authenticated'), null);
+    }
+
+    this.client.makeUnauthenticatedRequest('verifyUserAttribute', {
+      AttributeName: attributeName,
+      Code: confirmationCode,
+      AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+    }, err => {
+      if (err) {
+        return callback.onFailure(err);
+      }
+      return callback.onSuccess('SUCCESS');
+    });
+    return undefined;
+  }
+
+  /**
+   * This is used to get the device information using the current device key
+   * @param {object} callback Result callback map.
+   * @param {onFailure} callback.onFailure Called on any error.
+   * @param {onSuccess<*>} callback.onSuccess Called on success with device data.
+   * @returns {void}
+   */
+  getDevice(callback) {
+    if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
+      return callback(new Error('User is not authenticated'), null);
+    }
+
+    this.client.makeUnauthenticatedRequest('getDevice', {
+      AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+      DeviceKey: this.deviceKey,
+    }, (err, data) => {
+      if (err) {
+        return callback.onFailure(err);
+      }
+      return callback.onSuccess(data);
+    });
+    return undefined;
+  }
+
+  /**
+   * This is used to forget the current device
+   * @param {object} callback Result callback map.
+   * @param {onFailure} callback.onFailure Called on any error.
+   * @param {onSuccess<string>} callback.onSuccess Called on success.
+   * @returns {void}
+   */
+  forgetDevice(callback) {
+    if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
+      return callback(new Error('User is not authenticated'), null);
+    }
+
+    this.client.makeUnauthenticatedRequest('forgetDevice', {
+      AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+      DeviceKey: this.deviceKey,
+    }, err => {
+      if (err) {
+        return callback.onFailure(err);
+      }
+      this.deviceKey = null;
+      this.deviceGroupkey = null;
+      this.randomPassword = null;
+      this.clearCachedDeviceKeyAndPassword();
+      return callback.onSuccess('SUCCESS');
+    });
+    return undefined;
+  }
+
+  /**
+   * This is used to set the device status as remembered
+   * @param {object} callback Result callback map.
+   * @param {onFailure} callback.onFailure Called on any error.
+   * @param {onSuccess<string>} callback.onSuccess Called on success.
+   * @returns {void}
+   */
+  setDeviceStatusRemembered(callback) {
+    if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
+      return callback(new Error('User is not authenticated'), null);
+    }
+
+    this.client.makeUnauthenticatedRequest('updateDeviceStatus', {
+      AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+      DeviceKey: this.deviceKey,
+      DeviceRememberedStatus: 'remembered',
+    }, err => {
+      if (err) {
+        return callback.onFailure(err);
+      }
+      return callback.onSuccess('SUCCESS');
+    });
+    return undefined;
+  }
+
+  /**
+   * This is used to set the device status as not remembered
+   * @param {object} callback Result callback map.
+   * @param {onFailure} callback.onFailure Called on any error.
+   * @param {onSuccess<string>} callback.onSuccess Called on success.
+   * @returns {void}
+   */
+  setDeviceStatusNotRemembered(callback) {
+    if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
+      return callback(new Error('User is not authenticated'), null);
+    }
+
+    this.client.makeUnauthenticatedRequest('updateDeviceStatus', {
+      AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+      DeviceKey: this.deviceKey,
+      DeviceRememberedStatus: 'not_remembered',
+    }, err => {
+      if (err) {
+        return callback.onFailure(err);
+      }
+      return callback.onSuccess('SUCCESS');
+    });
+    return undefined;
+  }
+
+  /**
+   * This is used to list all devices for a user
+   *
+   * @param {int} limit the number of devices returned in a call
+   * @param {string} paginationToken the pagination token in case any was returned before
+   * @param {object} callback Result callback map.
+   * @param {onFailure} callback.onFailure Called on any error.
+   * @param {onSuccess<*>} callback.onSuccess Called on success with device list.
+   * @returns {void}
+   */
+  listDevices(limit, paginationToken, callback) {
+    if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
+      return callback(new Error('User is not authenticated'), null);
+    }
+
+    this.client.makeUnauthenticatedRequest('listDevices', {
+      AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+      Limit: limit,
+      PaginationToken: paginationToken,
+    }, (err, data) => {
+      if (err) {
+        return callback.onFailure(err);
+      }
+      return callback.onSuccess(data);
+    });
+    return undefined;
+  }
+
+  /**
+   * This is used to globally revoke all tokens issued to a user
+   * @param {object} callback Result callback map.
+   * @param {onFailure} callback.onFailure Called on any error.
+   * @param {onSuccess<string>} callback.onSuccess Called on success.
+   * @returns {void}
+   */
+  globalSignOut(callback) {
+    if (this.signInUserSession == null || !this.signInUserSession.isValid()) {
+      return callback(new Error('User is not authenticated'), null);
+    }
+
+    this.client.makeUnauthenticatedRequest('globalSignOut', {
+      AccessToken: this.signInUserSession.getAccessToken().getJwtToken(),
+    }, err => {
+      if (err) {
+        return callback.onFailure(err);
+      }
+      this.clearCachedTokens();
+      return callback.onSuccess('SUCCESS');
+    });
+    return undefined;
+  }
+
+  /**
    * This is used for the user to signOut of the application and clear the cached tokens.
    * @returns {void}
    */
   signOut() {
     this.signInUserSession = null;
-    self.clearCachedTokens();
+    this.clearCachedTokens();
   }
 }
